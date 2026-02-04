@@ -164,9 +164,9 @@ Successful output should show:
 ```
 .
 ├── feeds/
-│   ├── as<asn>_ipv4.txt
-│   ├── as<asn>_ipv6.txt
-│   ├── as<asn>_all.txt
+│   ├── <asn>_ipv4.txt
+│   ├── <asn>_ipv6.txt
+│   ├── <asn>_all.txt
 │   ├── combined_ipv4.txt
 │   ├── combined_ipv6.txt
 │   └── combined_all.txt
