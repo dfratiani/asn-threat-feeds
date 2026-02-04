@@ -56,9 +56,9 @@ for asn in ASNS:
     prefixes = fetch_prefixes(asn)
     v4 = sorted([p for p in prefixes if ":" not in p])
     v6 = sorted([p for p in prefixes if ":" in p])
-    write_list(OUTDIR / f"as{asn.lower()}_ipv4.txt", v4)
-    write_list(OUTDIR / f"as{asn.lower()}_ipv6.txt", v6)
-    write_list(OUTDIR / f"as{asn.lower()}_all.txt",  sorted(prefixes))
+    write_list(OUTDIR / f"{asn.lower()}_ipv4.txt", v4)
+    write_list(OUTDIR / f"{asn.lower()}_ipv6.txt", v6)
+    write_list(OUTDIR / f"{asn.lower()}_all.txt",  sorted(prefixes))
 
     all_v4.update(v4)
     all_v6.update(v6)
