@@ -2,33 +2,36 @@ name: Update ASN Feeds
 
 on:
   schedule:
-    - cron: "30 1 * * *"
+    - cron: "30 1 * * *"         # daily at 01:30 UTC
   workflow_dispatch:
-  
+
 permissions:
-  contents: write
+  contents: write                # allow pushing updated feeds
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    env:
+      ASNS: "AS19318"
+      MIN_PEERS: "10"            # tighten to 20–30 to reduce low-visibility prefixes
+      RIPE_SOURCEAPP: "asn-threat-feeds"
+      START_DAYS: "0"            # keep 0 to let RIPEstat default the window (~2 weeks)  [1](https://whois.ipip.net/AS19318)
+      END_DAYS: "0"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
-      - name: Run feed builder
-        run: |
-          python3 scripts/build_asn_feed.py
+      - name: Build feeds from RIPEstat
+        run: python3 scripts/build_multi_asn_feeds.py
 
       - name: Commit and push if changed
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if [ -n "$(git status --porcelain)" ]; then
             git add feeds/*.txt
-            git commit -m "Automated ASN19318 feed update"
+            git commit -m "Automated multi-ASN feed update"
             git push
           else
             echo "No changes"
