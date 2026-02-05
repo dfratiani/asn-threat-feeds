@@ -2,7 +2,7 @@ name: Update ASN Feeds
 
 on:
   schedule:
-    - cron: "30 1 * * *"         # daily at 01:30 UTC
+    - cron: "0 5 * * *"         # daily at 05:00 UTC/24:00 EST
   workflow_dispatch:
 
 permissions:
