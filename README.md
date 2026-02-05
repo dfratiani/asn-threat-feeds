@@ -80,18 +80,18 @@ Each file contains one CIDR per line with no headers or comments.
 
 Managed in the GitHub Actions workflow environment:
 
-ASNS
+ASNS  
 Comma-separated list of ASNs to include.  
-Example:
-AS19318,AS13335,AS15169
+Example:  
+AS19318,AS13335,AS15169  
 
 MIN_PEERS  
 Minimum number of BGP peers that must see a prefix before including it.  
-Default is 10.
+Default is 10.  
 
 START_DAYS / END_DAYS  
 Optional time window for BGP data.  
-If unset, the API default rolling window is used.
+If unset, the API default rolling window is used.  
 
 ---
 
