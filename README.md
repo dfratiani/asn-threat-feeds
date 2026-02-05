@@ -30,13 +30,13 @@ https://dfratiani.github.io/asn-threat-feeds/
 Each ASN produces three files:
 
 IPv4 only:
-https://dfratiani.github.io/asn-threat-feeds/feeds/<asn>_ipv4.txt
+https://dfratiani.github.io/asn-threat-feeds/feeds/<asn\>_ipv4.txt
 
 IPv6 only:
-https://dfratiani.github.io/asn-threat-feeds/feeds/<asn>_ipv6.txt
+https://dfratiani.github.io/asn-threat-feeds/feeds/<asn\>_ipv6.txt
 
 IPv4 + IPv6 combined:
-https://dfratiani.github.io/asn-threat-feeds/feeds/<asn>_all.txt
+https://dfratiani.github.io/asn-threat-feeds/feeds/<asn\>_all.txt
 
 Example:
 https://dfratiani.github.io/asn-threat-feeds/feeds/as19318_ipv4.txt
@@ -80,7 +80,7 @@ Each file contains one CIDR per line with no headers or comments.
 
 Managed in the GitHub Actions workflow environment:
 
-ASNS  
+ASNS
 Comma-separated list of ASNs to include.  
 Example:
 AS19318,AS13335,AS15169
@@ -104,7 +104,7 @@ config system external-resource
     edit "ASN_Combined_IPv4"
         set type address
         set resource "https://dfratiani.github.io/asn-threat-feeds/feeds/combined_ipv4.txt"
-        set refresh-rate 3600
+        set refresh-rate 1440
         set status enable
     next
 end
@@ -117,7 +117,7 @@ config system external-resource
     edit "ASN_Combined_IPv6"
         set type address
         set resource "https://dfratiani.github.io/asn-threat-feeds/feeds/combined_ipv6.txt"
-        set refresh-rate 3600
+        set refresh-rate 1440
         set status enable
     next
 end
@@ -169,7 +169,8 @@ Successful output should show:
 │   ├── <asn>_all.txt
 │   ├── combined_ipv4.txt
 │   ├── combined_ipv6.txt
-│   └── combined_all.txt
+│   ├── combined_all.txt
+│   └── exclusions.txt
 ├── scripts/
 │   └── build_multi_asn_feeds.py
 └── .github/
