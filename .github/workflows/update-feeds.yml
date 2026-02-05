@@ -12,7 +12,7 @@ jobs:
   update:
     runs-on: ubuntu-latest
     env:
-      ASNS: "AS19318"
+      ASNS: "AS19318"            # comma separated ASNs to query
       MIN_PEERS: "10"            # tighten to 20–30 to reduce low-visibility prefixes
       RIPE_SOURCEAPP: "asn-threat-feeds"
       START_DAYS: "0"            # keep 0 to let RIPEstat default the window (~2 weeks)  [1](https://whois.ipip.net/AS19318)
