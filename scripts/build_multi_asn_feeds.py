@@ -124,6 +124,11 @@ def collapse_and_sort(nets: Iterable[IPNet]) -> List[IPNet]:
     collapsed.sort(key=lambda n: (n.version, int(n.network_address), n.prefixlen))
     return collapsed
 
+def collapse_mixed(v4: Iterable[IPv4Net], v6: Iterable[IPv6Net]) -> List[IPNet]:
+    """Collapse IPv4 and IPv6 lists separately, then concatenate."""
+    v4c = collapse_and_sort(v4)
+    v6c = collapse_and_sort(v6)
+    return [*v4c, *v6c]
 
 def write_cidrs(path: Path, nets: Iterable[IPNet]) -> None:
     """Write one CIDR per line to path (creates parent dirs)."""
@@ -296,7 +301,8 @@ def build_feeds(
             write_cidrs(out_dir / f"{asn_norm.lower()}_ipv4.txt", v4_final)
             write_cidrs(out_dir / f"{asn_norm.lower()}_ipv6.txt", v6_final)
 
-            asn_all = collapse_and_sort([*v4_final, *v6_final])
+            # Per-ASN _all.txt (inside build_feeds loop)
+            asn_all = collapse_mixed(v4_final, v6_final)
             write_cidrs(out_dir / f"{asn_norm.lower()}_all.txt", asn_all)
 
             combined_v4.extend(v4_final)
@@ -313,7 +319,8 @@ def build_feeds(
     write_cidrs(out_dir / "combined_ipv4.txt", combined_v4)
     write_cidrs(out_dir / "combined_ipv6.txt", combined_v6)
 
-    combined_all = collapse_and_sort([*combined_v4, *combined_v6])
+    # Global combined_all.txt (after combined_v4/combined_v6 are finalized)
+    combined_all = collapse_mixed(combined_v4, combined_v6)
     write_cidrs(out_dir / "combined_all.txt", combined_all)
 
     print("[builder] Done.")
