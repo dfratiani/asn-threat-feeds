@@ -184,12 +184,10 @@ The feeds directory is intentionally committed and should not be ignored.
 
 ## Exclusions (Optional)
 
-To permanently exclude specific prefixes:
+To permanently exclude specific prefixes from all feeds, create `feeds/exclusions.txt` with one CIDR per line. Lines starting with `#` are treated as comments.
 
-1. Create:
-   feeds/exclusions.txt
-2. Add one CIDR per line
-3. The builder can subtract these prefixes before writing feed files
+- Exclusions are subtracted from **every** per‑ASN feed and from the **combined** feeds.
+- Subtraction is performed at CIDR granularity; larger input blocks are cleanly split to omit any excluded sub‑ranges.
 
 ---
 
