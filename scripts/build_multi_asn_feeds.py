@@ -43,7 +43,6 @@ IPv4Net = ipaddress.IPv4Network
 IPv6Net = ipaddress.IPv6Network
 IPNet = Union[IPv4Net, IPv6Net]
 
-
 # ----------------------
 # Exclusions helpers (self-contained)
 # ----------------------
@@ -67,7 +66,6 @@ def load_exclusions(path: str = "feeds/exclusions.txt") -> List[IPNet]:
             except ValueError:
                 print(f"[exclusions] WARN: Skipping invalid CIDR at line {lineno}: {line}", file=sys.stderr)
     return nets
-
 
 def _subtract_one(net: IPNet, excludes: Sequence[IPNet]) -> List[IPNet]:
     """
@@ -95,7 +93,6 @@ def _subtract_one(net: IPNet, excludes: Sequence[IPNet]) -> List[IPNet]:
             break
     return result
 
-
 def apply_exclusions(nets: Iterable[IPNet], excludes: Iterable[IPNet]) -> List[IPNet]:
     """
     Apply exclusions to an iterable of networks (mixed IPv4/IPv6 allowed).
@@ -113,7 +110,6 @@ def apply_exclusions(nets: Iterable[IPNet], excludes: Iterable[IPNet]) -> List[I
     collapsed = list(ipaddress.collapse_addresses(out))
     collapsed.sort(key=lambda n: (n.version, int(n.network_address), n.prefixlen))
     return collapsed
-
 
 # ----------------------
 # Normalization / IO
@@ -137,18 +133,15 @@ def write_cidrs(path: Path, nets: Iterable[IPNet]) -> None:
         for n in nets:
             f.write(str(n) + "\n")
 
-
 # ----------------------
 # RIPEstat client (Announced Prefixes)
 # ----------------------
 RIPESTAT_BASE = "https://stat.ripe.net/data/announced-prefixes/data.json"  # cite
 
-
 @dataclass
 class RipeWindow:
     start_iso: Optional[str] = None
     end_iso: Optional[str] = None
-
 
 def _compute_time_window(start_days: Optional[int], end_days: Optional[int]) -> RipeWindow:
     """
@@ -176,7 +169,6 @@ def _compute_time_window(start_days: Optional[int], end_days: Optional[int]) -> 
             print("[ripe] NOTE: START_DAYS produced a later time than END_DAYS; window swapped.", file=sys.stderr)
 
     return RipeWindow(start_iso, end_iso)
-
 
 def fetch_asn_prefixes_from_ripestat(
     asn: str,
@@ -240,14 +232,12 @@ def fetch_asn_prefixes_from_ripestat(
             print(f"[ripe] WARN: attempt {attempt}/{retries} failed for {asn}: {e}; retrying in {sleep_for:.1f}s", file=sys.stderr)
             time.sleep(sleep_for)
 
-
 # ----------------------
 # Builder
 # ----------------------
 def normalize(nets: Iterable[IPNet]) -> List[IPNet]:
     """Your existing dedupe/minimize pipeline can replace this if desired."""
     return collapse_and_sort(nets)
-
 
 def build_feeds(
     asns: List[str],
@@ -325,14 +315,12 @@ def build_feeds(
 
     print("[builder] Done.")
 
-
 # ----------------------
 # Entrypoint
 # ----------------------
 def _parse_env_list(var: str, default: str = "") -> List[str]:
     raw = os.environ.get(var, default)
     return [x.strip() for x in raw.split(",") if x.strip()]
-
 
 def main():
     """
@@ -345,7 +333,6 @@ def main():
     asns = _parse_env_list("ASNS")
     if not asns:
         raise SystemExit("ASNS is required (comma-separated list of target ASNs)")
-
     try:
         min_peers = int(os.environ.get("MIN_PEERS", "10"))
     except ValueError:
@@ -364,7 +351,6 @@ def main():
         end_days=end_days,
         out_dir=Path("feeds"),
     )
-
 
 if __name__ == "__main__":
     main()
