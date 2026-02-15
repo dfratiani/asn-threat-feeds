@@ -1,38 +1,76 @@
-name: Update ASN Feeds
+name: Update ASN Threat Feeds
 
 on:
-  schedule:
-    - cron: "0 5 * * *"         # daily at 05:00 UTC/24:00 EST
   workflow_dispatch:
+    inputs:
+      diag:
+        description: "Enable diagnostics mode (1 to enable)"
+        required: false
+        default: "0"
+  schedule:
+    - cron: "0 5 * * *"
 
 permissions:
-  contents: write                # allow pushing updated feeds
+  contents: write
 
 jobs:
-  update:
+  build:
     runs-on: ubuntu-latest
     env:
-      ASNS: "AS19318"            # comma separated ASNs to query
-      MIN_PEERS: "10"            # tighten to 20–30 to reduce low-visibility prefixes
-      RIPE_SOURCEAPP: "asn-threat-feeds"
-      START_DAYS: "0"            # keep 0 to let RIPEstat default the window (~2 weeks)  [1](https://whois.ipip.net/AS19318)
-      END_DAYS: "0"
+      # --- Configure your targets here ---
+      # ASNs can include "AS" prefix or just the number, comma-separated:
+      ASNS: AS19318
+      # Minimum RIS peers seeing a prefix (RIPEstat filters):
+      MIN_PEERS: "10"
+      # Optional time window (unset for RIPEstat default rolling window)
+      # START_DAYS: "7"
+      # END_DAYS: "0"
+
+      # --- Diagnostics (set DIAG=1 to enable) ---
+      DIAG: ${{ github.event.inputs.diag || '0' }}
+      DIAG_MAX_PREFIXES: "50"
+      DIAG_WRITE_FILES: "1"
+      DIAG_SHOW_EXCLUSIONS: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build feeds from RIPEstat
-        run: python3 scripts/build_multi_asn_feeds.py
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Commit and push if changed
+      - name: Run builder
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python scripts/build_multi_asn_feeds.py
+
+      - name: Show diagnostic summary (if any)
+        if: env.DIAG == '1'
+        run: |
+          echo "Diagnostics enabled, dumping brief summary:"
+          ls -la feeds || true
+          ls -la feeds/diag || true
+          echo "---- build.log (tail) ----"
+          tail -n 200 feeds/diag/build.log || true
+
+      - name: Upload diagnostics artifact
+        if: env.DIAG == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ github.run_id }}
+          path: |
+            feeds/diag/
+
+      - name: Commit and push if feeds changed
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -n "$(git status --porcelain)" ]; then
-            git add feeds/*.txt
-            git commit -m "Automated multi-ASN feed update"
+            git add -A
+            git commit -m "Update feeds (CI) [skip ci]"
             git push
           else
-            echo "No changes"
+            echo "No changes to commit."
           fi
