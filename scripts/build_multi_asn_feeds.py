@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_multi_asn_feeds.py
+build_multi_asn_feeds.py  — with Diagnostics Mode
 
 Generates FortiGate-compatible CIDR feeds from live BGP announcements
 for one or more ASNs using RIPEstat's "announced-prefixes" API.
 
-Key features
-------------
-- Honors minimum RIS visibility (MIN_PEERS) via RIPEstat min_peers_seeing
-- Optional time window using START_DAYS / END_DAYS (rolling window if unset)
-- Per-ASN outputs: as<asn>_ipv4.txt, as<asn>_ipv6.txt, as<asn>_all.txt
-- Combined outputs: combined_ipv4.txt, combined_ipv6.txt, combined_all.txt
-- Exclusions (feeds/exclusions.txt) with inline comment support (#, ;, //)
-- True set subtraction: excludes are removed from announced prefixes,
-  splitting CIDRs when an exclusion falls inside a larger prefix
-- Normalizes and deduplicates outputs, guarantees one CIDR per line, no comments
+DIAGNOSTICS MODE (env DIAG=1)
+-----------------------------
+When enabled, prints richer runtime details and can write diagnostic
+artifacts to feeds/diag/:
+  - Effective environment (ASNS/MIN_PEERS/time window/diag flags)
+  - Raw vs. post-exclusion counts per ASN
+  - Optional prefix samples before/after exclusions
+  - Build log and final feed sizes
 
 Environment variables
 ---------------------
 ASNS        Comma-separated list of ASNs, e.g. "AS19318,AS13335,AS15169"
 MIN_PEERS   Minimum RIS peers seeing a prefix (default: 10)
-START_DAYS  Optional integer: start time = now() - START_DAYS days
-END_DAYS    Optional integer: end time   = now() - END_DAYS   days
-            (If neither provided, RIPEstat uses its default rolling window.)
-            (If only START_DAYS is provided, end defaults to "now".)
+START_DAYS  Optional int: start time = now() - START_DAYS days
+END_DAYS    Optional int: end time   = now() - END_DAYS   days
+            If neither is set, RIPEstat uses its default rolling window.
+
+# Diagnostics (all optional)
+DIAG                    "0" (default) or "1" to enable diagnostics
+DIAG_MAX_PREFIXES       Max sample lines to print/write (default: 50)
+DIAG_WRITE_FILES        "0"/"1" write detailed samples under feeds/diag/ (default: 1)
+DIAG_SHOW_EXCLUSIONS    "0"/"1" echo first N lines of exclusions (default: 1)
 
 Outputs
 -------
@@ -35,24 +38,22 @@ feeds/
   combined_ipv4.txt
   combined_ipv6.txt
   combined_all.txt
-
-Notes
------
-- The exclusions file (feeds/exclusions.txt) accepts inline comments after the
-  CIDR or IP using '#', ';', or '//' and supports single IPs as /32 or /128.
-- Final feed files contain pure CIDRs with no comments or headers.
-
+  diag/                (only if DIAG=1)
+    build.log
+    as<asn>_raw.txt
+    as<asn>_after_exclusions.txt
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
 import ipaddress
 import urllib.parse
@@ -63,12 +64,10 @@ import urllib.request
 
 FEEDS_DIR = Path("feeds")
 EXCLUSIONS_FILE = FEEDS_DIR / "exclusions.txt"
+DIAG_DIR = FEEDS_DIR / "diag"
 
 # RIPEstat endpoint: announced-prefixes
-# Docs: https://stat.ripe.net/docs/02.data-api/announced-prefixes.html
-RIPES_ANNOUNCED_PREFIXES = (
-    "https://stat.ripe.net/data/announced-prefixes/data.json"
-)
+RIPES_ANNOUNCED_PREFIXES = "https://stat.ripe.net/data/announced-prefixes/data.json"
 
 # Comment tokens accepted in feeds/exclusions.txt (inline comments after CIDR)
 COMMENT_TOKENS = ("#", ";", "//")
@@ -79,7 +78,53 @@ HTTP_RETRY = 3
 HTTP_RETRY_SLEEP = 2  # seconds base (exponential backoff)
 
 
-# ------------------------------- Logging setup --------------------------------
+# ------------------------------- Diagnostics ---------------------------------
+
+def _as_bool(val: Optional[str], default: bool = False) -> bool:
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+class Diag:
+    """Simple diagnostics helper that can buffer + write to feeds/diag/build.log."""
+    enabled: bool
+    max_prefixes: int
+    write_files: bool
+    show_exclusions: bool
+    log_buffer: io.StringIO
+
+    def __init__(self) -> None:
+        self.enabled = _as_bool(os.environ.get("DIAG"), False)
+        self.max_prefixes = int(os.environ.get("DIAG_MAX_PREFIXES", "50"))
+        self.write_files = _as_bool(os.environ.get("DIAG_WRITE_FILES"), True)
+        self.show_exclusions = _as_bool(os.environ.get("DIAG_SHOW_EXCLUSIONS"), True)
+        self.log_buffer = io.StringIO()
+
+    def print(self, *args) -> None:
+        msg = " ".join(str(a) for a in args)
+        logging.info(msg)
+        if self.enabled:
+            self.log_buffer.write(msg + "\n")
+
+    def dump_to_file(self) -> None:
+        if not self.enabled:
+            return
+        DIAG_DIR.mkdir(parents=True, exist_ok=True)
+        (DIAG_DIR / "build.log").write_text(self.log_buffer.getvalue(), encoding="utf-8")
+
+    def write_sample(self, name: str, lines: Sequence[str]) -> None:
+        if not (self.enabled and self.write_files):
+            return
+        DIAG_DIR.mkdir(parents=True, exist_ok=True)
+        sample = lines[: self.max_prefixes]
+        (DIAG_DIR / name).write_text("\n".join(sample) + ("\n" if sample else ""), encoding="utf-8")
+
+
+diag = Diag()
+
+
+# ------------------------------ Logging setup --------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,19 +145,19 @@ def _iso8601_from_days(days_ago: Optional[int]) -> Optional[str]:
 
 
 def _http_get_json(url: str, params: dict) -> dict:
-    """GET JSON with minimal retries/backoff using urllib (no third-party deps)."""
+    """GET JSON with retries/backoff using urllib (no third-party deps)."""
     q = urllib.parse.urlencode(params)
     full_url = f"{url}?{q}"
     last_err: Optional[Exception] = None
     for attempt in range(1, HTTP_RETRY + 1):
         try:
-            req = urllib.request.Request(full_url, headers={"User-Agent": "asn-threat-feeds/1.0"})
+            req = urllib.request.Request(full_url, headers={"User-Agent": "asn-threat-feeds/1.1"})
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 data = resp.read()
                 return json.loads(data.decode("utf-8"))
-        except Exception as e:  # noqa: BLE001 - intentional broad catch for network robustness
+        except Exception as e:  # noqa: BLE001
             last_err = e
             sleep_for = HTTP_RETRY_SLEEP * (2 ** (attempt - 1))
             logging.warning("GET failed (%s) attempt %d/%d: %s; retrying in %ss",
@@ -143,58 +188,51 @@ def load_exclusions(path: Path) -> Set[ipaddress._BaseNetwork]:
     """
     Load exclusions from `path`, allowing inline comments on the same line.
     - Accepts IPv4/IPv6 CIDRs OR single IPs (treated as /32 or /128) with strict=False
-    - Ignores blank/comment-only/malformed lines, logging a warning with the line number.
+    - Ignores blank/comment-only/malformed lines; logs a warning with the line number.
     """
     exclusions: Set[ipaddress._BaseNetwork] = set()
     if not path.exists():
-        logging.info("No exclusions file found at %s; continuing without exclusions.", path)
+        diag.print(f"No exclusions file found at {path}; continuing without exclusions.")
         return exclusions
 
-    with path.open("r", encoding="utf-8") as f:
-        for lineno, raw in enumerate(f, 1):
-            cleaned = _strip_inline_comment(raw.strip())
-            if not cleaned:
-                continue
-            try:
-                net = ipaddress.ip_network(cleaned, strict=False)
-                exclusions.add(net)
-            except ValueError:
-                logging.warning("Skipping invalid exclusion on line %d: %r", lineno, raw.rstrip())
-    logging.info(
-        "Loaded %d exclusions (%d IPv4, %d IPv6) from %s",
-        len(exclusions),
-        sum(1 for n in exclusions if isinstance(n, ipaddress.IPv4Network)),
-        sum(1 for n in exclusions if isinstance(n, ipaddress.IPv6Network)),
-        path,
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if diag.enabled and diag.show_exclusions:
+        diag.print(f"DIAG: Showing up to {diag.max_prefixes} lines of exclusions (raw file):")
+        for i, line in enumerate(lines[: diag.max_prefixes], 1):
+            diag.print(f"{i:4d}: {line}")
+
+    for lineno, raw in enumerate(lines, 1):
+        cleaned = _strip_inline_comment(raw.strip())
+        if not cleaned:
+            continue
+        try:
+            net = ipaddress.ip_network(cleaned, strict=False)
+            exclusions.add(net)
+        except ValueError:
+            logging.warning("Skipping invalid exclusion on line %d: %r", lineno, raw.rstrip())
+
+    diag.print(
+        f"Loaded {len(exclusions)} exclusions "
+        f"({sum(1 for n in exclusions if isinstance(n, ipaddress.IPv4Network))} IPv4, "
+        f"{sum(1 for n in exclusions if isinstance(n, ipaddress.IPv6Network))} IPv6) from {path}"
     )
     return exclusions
 
 
 # --------------------------- Prefix subtraction logic -------------------------
 
-def split_network(net: ipaddress._BaseNetwork) -> Tuple[ipaddress._BaseNetwork, ipaddress._BaseNetwork]:
-    """Split a network into two equal subnets (next prefix length)."""
+def split_network(net: ipaddress._BaseNetwork) -> tuple[ipaddress._BaseNetwork, ipaddress._BaseNetwork]:
     first, second = tuple(net.subnets(prefixlen_diff=1))
     return first, second
 
 
 def subtract_one(net: ipaddress._BaseNetwork, exc: ipaddress._BaseNetwork) -> List[ipaddress._BaseNetwork]:
-    """
-    Subtract a single exclusion `exc` from `net`.
-    Returns a list of 0..N networks covering net \ exc (minimal set).
-    """
-    # If disjoint, nothing to subtract
+    """Subtract a single exclusion `exc` from `net` and return residuals."""
     if not net.overlaps(exc):
         return [net]
-    # If exclusion fully covers net, result is empty
-    if net.subnet_of(exc):
+    if net.subnet_of(exc) or net == exc:
         return []
-    # If exclusion is equal to net, remove entirely
-    if net == exc:
-        return []
-    # Otherwise, recursively split net until we can remove the covered part
     if net.prefixlen == net.max_prefixlen:
-        # /32 or /128 single address case and not fully covered: keep it
         return [net]
     a, b = split_network(net)
     res: List[ipaddress._BaseNetwork] = []
@@ -207,7 +245,6 @@ def subtract_one(net: ipaddress._BaseNetwork, exc: ipaddress._BaseNetwork) -> Li
 
 
 def subtract_many(net: ipaddress._BaseNetwork, excludes: Iterable[ipaddress._BaseNetwork]) -> List[ipaddress._BaseNetwork]:
-    """Subtract multiple exclusions from a network."""
     result = [net]
     for exc in excludes:
         new_result: List[ipaddress._BaseNetwork] = []
@@ -221,9 +258,7 @@ def subtract_many(net: ipaddress._BaseNetwork, excludes: Iterable[ipaddress._Bas
 
 def apply_exclusions(prefixes: Iterable[str], exclusions: Set[ipaddress._BaseNetwork]) -> List[str]:
     """
-    Apply exclusions to an iterable of string prefixes.
-    - For each prefix, subtract all overlapping excludes (true set difference).
-    - Collapse/normalize and return string CIDRs with prefix length.
+    Apply exclusions to an iterable of string prefixes (true set difference).
     """
     out_v4: List[ipaddress.IPv4Network] = []
     out_v6: List[ipaddress.IPv6Network] = []
@@ -247,7 +282,6 @@ def apply_exclusions(prefixes: Iterable[str], exclusions: Set[ipaddress._BaseNet
             residuals = subtract_many(net, overlaps) if overlaps else [net]
             out_v6.extend(n for n in residuals if isinstance(n, ipaddress.IPv6Network))
 
-    # Normalize: collapse contiguous/overlapping networks
     collapsed_v4 = ipaddress.collapse_addresses(out_v4)
     collapsed_v6 = ipaddress.collapse_addresses(out_v6)
 
@@ -265,7 +299,6 @@ def fetch_announced_prefixes(asn: str, min_peers: int,
     Query RIPEstat for announced prefixes of `asn`, respecting min_peers_seeing
     and optional time window. Returns list of CIDR strings.
     """
-    # Normalize ASN (strip "AS" if present)
     asn_clean = asn.upper().removeprefix("AS")
     params = {
         "resource": asn_clean,
@@ -277,7 +310,6 @@ def fetch_announced_prefixes(asn: str, min_peers: int,
         params["endtime"] = end_iso
 
     data = _http_get_json(RIPES_ANNOUNCED_PREFIXES, params)
-    # RIPEstat places prefixes under data->prefixes; each item has 'prefix'
     prefixes = []
     try:
         items = data["data"]["prefixes"]
@@ -289,10 +321,6 @@ def fetch_announced_prefixes(asn: str, min_peers: int,
         logging.error("Unexpected RIPEstat response for AS%s: %s", asn_clean, e)
         raise
 
-    logging.info("AS%s: fetched %d announced prefixes (min_peers=%d)%s%s",
-                 asn_clean, len(prefixes), min_peers,
-                 f", start={start_iso}" if start_iso else "",
-                 f", end={end_iso}" if end_iso else "")
     return prefixes
 
 
@@ -328,8 +356,6 @@ def normalize_cidrs(cidrs: Iterable[str]) -> List[str]:
     v4_collapsed = ipaddress.collapse_addresses(sorted(v4_nets, key=lambda n: (int(n.network_address), n.prefixlen)))
     v6_collapsed = ipaddress.collapse_addresses(sorted(v6_nets, key=lambda n: (int(n.network_address), n.prefixlen)))
 
-    out = [n.with_prefixlen for n in v4_collapsed] + [n.with_prefixlen for n in v6_collapsed]
-    # sort as strings for stable output: v4 before v6 for readability
     out_v4 = [n.with_prefixlen for n in v4_collapsed]
     out_v6 = [n.with_prefixlen for n in v6_collapsed]
     return out_v4 + out_v6
@@ -367,9 +393,18 @@ def build_for_asn(asn: str,
     Returns (ipv4_list, ipv6_list, all_list).
     """
     raw = fetch_announced_prefixes(asn, min_peers, start_iso, end_iso)
+    diag.print(f"AS{asn.upper().removeprefix('AS')}: raw count before exclusions: {len(raw)}")
+    if diag.enabled:
+        diag.write_sample(f"as{asn.lower().removeprefix('as')}_raw.txt", [p for p in raw][: diag.max_prefixes])
 
-    # Apply exclusions (true subtraction) then normalize/dedupe
     filtered = apply_exclusions(raw, exclusions) if exclusions else raw
+    diag.print(f"AS{asn.upper().removeprefix('AS')}: count after exclusions: {len(filtered)}")
+    if diag.enabled:
+        diag.write_sample(
+            f"as{asn.lower().removeprefix('as')}_after_exclusions.txt",
+            [p for p in filtered][: diag.max_prefixes],
+        )
+
     final = normalize_cidrs(filtered)
 
     v4, v6 = separate_v4_v6(final)
@@ -408,7 +443,14 @@ def main() -> None:
     except ValueError as e:
         raise SystemExit(f"Invalid START_DAYS/END_DAYS: {e}") from e
 
-    # Load exclusions (supports inline comments)
+    # Diagnostics header
+    if diag.enabled:
+        diag.print("=== DIAGNOSTICS MODE ENABLED ===")
+        diag.print(f"ASNS={asns_env}")
+        diag.print(f"MIN_PEERS={min_peers}")
+        diag.print(f"START_ISO={start_iso}  END_ISO={end_iso}")
+        diag.print(f"DIAG_MAX_PREFIXES={diag.max_prefixes} DIAG_WRITE_FILES={diag.write_files} DIAG_SHOW_EXCLUSIONS={diag.show_exclusions}")
+
     exclusions = load_exclusions(EXCLUSIONS_FILE)
 
     # Per-ASN builds
@@ -431,6 +473,13 @@ def main() -> None:
     write_lines(FEEDS_DIR / "combined_ipv4.txt", combined_v4)
     write_lines(FEEDS_DIR / "combined_ipv6.txt", combined_v6)
     write_lines(FEEDS_DIR / "combined_all.txt", combined_all)
+
+    if diag.enabled:
+        # Show final sizes
+        for name in ("combined_ipv4.txt", "combined_ipv6.txt", "combined_all.txt"):
+            p = FEEDS_DIR / name
+            diag.print(f"{name}: {'missing' if not p.exists() else p.stat().st_size} bytes")
+        diag.dump_to_file()
 
     logging.info("Done. %d ASNs processed.", len(asns))
 
