@@ -18,10 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # --- Configure your targets here ---
-      # ASNs can include "AS" prefix or just the number, comma-separated:
-      ASNS: AS19318
-      # Minimum RIS peers seeing a prefix (RIPEstat filters):
-      MIN_PEERS: "10"
+      ASNS: AS19318                     # Example; comma-separated values are supported
+      MIN_PEERS: "10"                   # RIPEstat min_peers_seeing
+
       # Optional time window (unset for RIPEstat default rolling window)
       # START_DAYS: "7"
       # END_DAYS: "0"
@@ -32,6 +31,9 @@ jobs:
       DIAG_WRITE_FILES: "1"
       DIAG_SHOW_EXCLUSIONS: "1"
 
+      # Provide run id to the script so it writes to feeds/diag/<run_id>/
+      GITHUB_RUN_ID: ${{ github.run_id }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,6 +42,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Echo effective environment (quick view)
+        run: |
+          echo "ASNS=$ASNS"
+          echo "MIN_PEERS=$MIN_PEERS"
+          echo "START_DAYS=$START_DAYS END_DAYS=$END_DAYS"
+          echo "DIAG=$DIAG DIAG_MAX_PREFIXES=$DIAG_MAX_PREFIXES DIAG_WRITE_FILES=$DIAG_WRITE_FILES DIAG_SHOW_EXCLUSIONS=$DIAG_SHOW_EXCLUSIONS"
+          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
 
       - name: Run builder
         run: |
@@ -52,15 +62,16 @@ jobs:
           ls -la feeds || true
           ls -la feeds/diag || true
           echo "---- build.log (tail) ----"
-          tail -n 200 feeds/diag/build.log || true
+          tail -n 200 "feeds/diag/$GITHUB_RUN_ID/build.log" || true
+          echo "---- summary.json ----"
+          cat "feeds/diag/$GITHUB_RUN_ID/summary.json" || true
 
       - name: Upload diagnostics artifact
         if: env.DIAG == '1'
         uses: actions/upload-artifact@v4
         with:
           name: diag-${{ github.run_id }}
-          path: |
-            feeds/diag/
+          path: feeds/diag/
 
       - name: Commit and push if feeds changed
         run: |
