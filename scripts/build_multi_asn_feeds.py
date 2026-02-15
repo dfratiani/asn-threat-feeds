@@ -1,356 +1,439 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 build_multi_asn_feeds.py
 
-Generates FortiGate-compatible CIDR feeds for:
-  - per-ASN IPv4, IPv6, and combined (v4+v6) files
-  - global combined IPv4, IPv6, and combined (v4+v6) files
+Generates FortiGate-compatible CIDR feeds from live BGP announcements
+for one or more ASNs using RIPEstat's "announced-prefixes" API.
 
-Data source:
-  - RIPEstat "Announced Prefixes" API with min_peers_seeing support
-    Docs: https://stat.ripe.net/docs/02.data-api/announced-prefixes.html  # cite
-    We map:
-      MIN_PEERS   -> min_peers_seeing
-      START_DAYS  -> starttime (now - START_DAYS days)
-      END_DAYS    -> endtime   (now - END_DAYS days)
+Key features
+------------
+- Honors minimum RIS visibility (MIN_PEERS) via RIPEstat min_peers_seeing
+- Optional time window using START_DAYS / END_DAYS (rolling window if unset)
+- Per-ASN outputs: as<asn>_ipv4.txt, as<asn>_ipv6.txt, as<asn>_all.txt
+- Combined outputs: combined_ipv4.txt, combined_ipv6.txt, combined_all.txt
+- Exclusions (feeds/exclusions.txt) with inline comment support (#, ;, //)
+- True set subtraction: excludes are removed from announced prefixes,
+  splitting CIDRs when an exclusion falls inside a larger prefix
+- Normalizes and deduplicates outputs, guarantees one CIDR per line, no comments
 
-Exclusions:
-  - Optional file: feeds/exclusions.txt
-  - One CIDR per line (IPv4 or IPv6); lines starting with "#" are comments.
-  - Exclusions are subtracted from *all* outputs (per-ASN and combined).
-  - After subtraction, outputs are minimized & de-duplicated.
+Environment variables
+---------------------
+ASNS        Comma-separated list of ASNs, e.g. "AS19318,AS13335,AS15169"
+MIN_PEERS   Minimum RIS peers seeing a prefix (default: 10)
+START_DAYS  Optional integer: start time = now() - START_DAYS days
+END_DAYS    Optional integer: end time   = now() - END_DAYS   days
+            (If neither provided, RIPEstat uses its default rolling window.)
+            (If only START_DAYS is provided, end defaults to "now".)
+
+Outputs
+-------
+feeds/
+  as<asn>_ipv4.txt
+  as<asn>_ipv6.txt
+  as<asn>_all.txt
+  combined_ipv4.txt
+  combined_ipv6.txt
+  combined_all.txt
+
+Notes
+-----
+- The exclusions file (feeds/exclusions.txt) accepts inline comments after the
+  CIDR or IP using '#', ';', or '//' and supports single IPs as /32 or /128.
+- Final feed files contain pure CIDRs with no comments or headers.
 
 """
 
 from __future__ import annotations
 
-import ipaddress
 import json
+import logging
 import os
-import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-import requests
+import ipaddress
+import urllib.parse
+import urllib.request
 
-# ----------------------
-# Types
-# ----------------------
-IPv4Net = ipaddress.IPv4Network
-IPv6Net = ipaddress.IPv6Network
-IPNet = Union[IPv4Net, IPv6Net]
 
-# ----------------------
-# Exclusions helpers (self-contained)
-# ----------------------
-def load_exclusions(path: str = "feeds/exclusions.txt") -> List[IPNet]:
+# ------------------------------- Configuration -------------------------------
+
+FEEDS_DIR = Path("feeds")
+EXCLUSIONS_FILE = FEEDS_DIR / "exclusions.txt"
+
+# RIPEstat endpoint: announced-prefixes
+# Docs: https://stat.ripe.net/docs/02.data-api/announced-prefixes.html
+RIPES_ANNOUNCED_PREFIXES = (
+    "https://stat.ripe.net/data/announced-prefixes/data.json"
+)
+
+# Comment tokens accepted in feeds/exclusions.txt (inline comments after CIDR)
+COMMENT_TOKENS = ("#", ";", "//")
+
+# HTTP defaults
+HTTP_TIMEOUT = 30  # seconds
+HTTP_RETRY = 3
+HTTP_RETRY_SLEEP = 2  # seconds base (exponential backoff)
+
+
+# ------------------------------- Logging setup --------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
+# ------------------------------ Utility helpers -------------------------------
+
+def _iso8601_from_days(days_ago: Optional[int]) -> Optional[str]:
+    """Return an ISO8601 UTC timestamp for 'now - days_ago' if provided."""
+    if days_ago is None:
+        return None
+    if days_ago < 0:
+        raise ValueError("START_DAYS/END_DAYS cannot be negative.")
+    dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return dt.replace(microsecond=0).isoformat()
+
+
+def _http_get_json(url: str, params: dict) -> dict:
+    """GET JSON with minimal retries/backoff using urllib (no third-party deps)."""
+    q = urllib.parse.urlencode(params)
+    full_url = f"{url}?{q}"
+    last_err: Optional[Exception] = None
+    for attempt in range(1, HTTP_RETRY + 1):
+        try:
+            req = urllib.request.Request(full_url, headers={"User-Agent": "asn-threat-feeds/1.0"})
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                data = resp.read()
+                return json.loads(data.decode("utf-8"))
+        except Exception as e:  # noqa: BLE001 - intentional broad catch for network robustness
+            last_err = e
+            sleep_for = HTTP_RETRY_SLEEP * (2 ** (attempt - 1))
+            logging.warning("GET failed (%s) attempt %d/%d: %s; retrying in %ss",
+                            url, attempt, HTTP_RETRY, e, sleep_for)
+            time.sleep(sleep_for)
+    assert last_err is not None
+    raise last_err
+
+
+def _strip_inline_comment(line: str) -> str:
     """
-    Read exclusion networks from feeds/exclusions.txt.
-    Supports blank lines and '#' comments.
-    Missing file -> returns empty list (no-op).
+    Returns the line up to (but not including) the first inline comment token.
+    Recognizes '#', ';', and '//' comments. Trims surrounding whitespace.
     """
-    p = Path(path)
-    if not p.exists():
-        return []
-    nets: List[IPNet] = []
-    with p.open("r", encoding="utf-8") as f:
+    if not line:
+        return ""
+    idxs = []
+    for tok in COMMENT_TOKENS:
+        i = line.find(tok)
+        if i != -1:
+            idxs.append(i)
+    if idxs:
+        line = line[:min(idxs)]
+    return line.strip()
+
+
+def load_exclusions(path: Path) -> Set[ipaddress._BaseNetwork]:
+    """
+    Load exclusions from `path`, allowing inline comments on the same line.
+    - Accepts IPv4/IPv6 CIDRs OR single IPs (treated as /32 or /128) with strict=False
+    - Ignores blank/comment-only/malformed lines, logging a warning with the line number.
+    """
+    exclusions: Set[ipaddress._BaseNetwork] = set()
+    if not path.exists():
+        logging.info("No exclusions file found at %s; continuing without exclusions.", path)
+        return exclusions
+
+    with path.open("r", encoding="utf-8") as f:
         for lineno, raw in enumerate(f, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
+            cleaned = _strip_inline_comment(raw.strip())
+            if not cleaned:
                 continue
             try:
-                nets.append(ipaddress.ip_network(line, strict=False))
+                net = ipaddress.ip_network(cleaned, strict=False)
+                exclusions.add(net)
             except ValueError:
-                print(f"[exclusions] WARN: Skipping invalid CIDR at line {lineno}: {line}", file=sys.stderr)
-    return nets
+                logging.warning("Skipping invalid exclusion on line %d: %r", lineno, raw.rstrip())
+    logging.info(
+        "Loaded %d exclusions (%d IPv4, %d IPv6) from %s",
+        len(exclusions),
+        sum(1 for n in exclusions if isinstance(n, ipaddress.IPv4Network)),
+        sum(1 for n in exclusions if isinstance(n, ipaddress.IPv6Network)),
+        path,
+    )
+    return exclusions
 
-def _subtract_one(net: IPNet, excludes: Sequence[IPNet]) -> List[IPNet]:
+
+# --------------------------- Prefix subtraction logic -------------------------
+
+def split_network(net: ipaddress._BaseNetwork) -> Tuple[ipaddress._BaseNetwork, ipaddress._BaseNetwork]:
+    """Split a network into two equal subnets (next prefix length)."""
+    first, second = tuple(net.subnets(prefixlen_diff=1))
+    return first, second
+
+
+def subtract_one(net: ipaddress._BaseNetwork, exc: ipaddress._BaseNetwork) -> List[ipaddress._BaseNetwork]:
     """
-    Subtract multiple exclusion networks from a single network.
-    Uses ipaddress.address_exclude() where applicable.
+    Subtract a single exclusion `exc` from `net`.
+    Returns a list of 0..N networks covering net \ exc (minimal set).
     """
-    result: List[IPNet] = [net]
-    for ex in excludes:
-        # Skip family mismatch early
-        if net.version != ex.version:
-            continue
-        new_result: List[IPNet] = []
-        for r in result:
-            if ex.subnet_of(r):
-                # ex is inside r -> split r into pieces that exclude ex
-                new_result.extend(r.address_exclude(ex))
-            elif r.subnet_of(ex) or r == ex:
-                # r is fully covered by ex (drop it)
-                continue
-            else:
-                # disjoint
-                new_result.append(r)
+    # If disjoint, nothing to subtract
+    if not net.overlaps(exc):
+        return [net]
+    # If exclusion fully covers net, result is empty
+    if net.subnet_of(exc):
+        return []
+    # If exclusion is equal to net, remove entirely
+    if net == exc:
+        return []
+    # Otherwise, recursively split net until we can remove the covered part
+    if net.prefixlen == net.max_prefixlen:
+        # /32 or /128 single address case and not fully covered: keep it
+        return [net]
+    a, b = split_network(net)
+    res: List[ipaddress._BaseNetwork] = []
+    for child in (a, b):
+        if child.overlaps(exc):
+            res.extend(subtract_one(child, exc))
+        else:
+            res.append(child)
+    return res
+
+
+def subtract_many(net: ipaddress._BaseNetwork, excludes: Iterable[ipaddress._BaseNetwork]) -> List[ipaddress._BaseNetwork]:
+    """Subtract multiple exclusions from a network."""
+    result = [net]
+    for exc in excludes:
+        new_result: List[ipaddress._BaseNetwork] = []
+        for piece in result:
+            new_result.extend(subtract_one(piece, exc))
         result = new_result
         if not result:
             break
     return result
 
-def apply_exclusions(nets: Iterable[IPNet], excludes: Iterable[IPNet]) -> List[IPNet]:
+
+def apply_exclusions(prefixes: Iterable[str], exclusions: Set[ipaddress._BaseNetwork]) -> List[str]:
     """
-    Apply exclusions to an iterable of networks (mixed IPv4/IPv6 allowed).
-    Returns a minimal, sorted list of networks after subtraction.
+    Apply exclusions to an iterable of string prefixes.
+    - For each prefix, subtract all overlapping excludes (true set difference).
+    - Collapse/normalize and return string CIDRs with prefix length.
     """
-    excludes = list(excludes)
-    excludes_v4 = [e for e in excludes if isinstance(e, ipaddress.IPv4Network)]
-    excludes_v6 = [e for e in excludes if isinstance(e, ipaddress.IPv6Network)]
+    out_v4: List[ipaddress.IPv4Network] = []
+    out_v6: List[ipaddress.IPv6Network] = []
 
-    out: List[IPNet] = []
-    for n in nets:
-        exs = excludes_v4 if isinstance(n, ipaddress.IPv4Network) else excludes_v6
-        out.extend(_subtract_one(n, exs))
+    v4_ex = [e for e in exclusions if isinstance(e, ipaddress.IPv4Network)]
+    v6_ex = [e for e in exclusions if isinstance(e, ipaddress.IPv6Network)]
 
-    collapsed = list(ipaddress.collapse_addresses(out))
-    collapsed.sort(key=lambda n: (n.version, int(n.network_address), n.prefixlen))
-    return collapsed
-
-# ----------------------
-# Normalization / IO
-# ----------------------
-def collapse_and_sort(nets: Iterable[IPNet]) -> List[IPNet]:
-    """Collapse adjacent/sibling prefixes and return stable order."""
-    collapsed = list(ipaddress.collapse_addresses(nets))
-    collapsed.sort(key=lambda n: (n.version, int(n.network_address), n.prefixlen))
-    return collapsed
-
-def collapse_mixed(v4: Iterable[IPv4Net], v6: Iterable[IPv6Net]) -> List[IPNet]:
-    """Collapse IPv4 and IPv6 lists separately, then concatenate."""
-    v4c = collapse_and_sort(v4)
-    v6c = collapse_and_sort(v6)
-    return [*v4c, *v6c]
-
-def write_cidrs(path: Path, nets: Iterable[IPNet]) -> None:
-    """Write one CIDR per line to path (creates parent dirs)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for n in nets:
-            f.write(str(n) + "\n")
-
-# ----------------------
-# RIPEstat client (Announced Prefixes)
-# ----------------------
-RIPESTAT_BASE = "https://stat.ripe.net/data/announced-prefixes/data.json"  # cite
-
-@dataclass
-class RipeWindow:
-    start_iso: Optional[str] = None
-    end_iso: Optional[str] = None
-
-def _compute_time_window(start_days: Optional[int], end_days: Optional[int]) -> RipeWindow:
-    """
-    START_DAYS / END_DAYS are interpreted as offsets from 'now' (UTC).
-      - If only START_DAYS: start = now - START_DAYS, end unset (now per RIPEstat default)
-      - If only END_DAYS:   end   = now - END_DAYS
-      - If both:            start = now - START_DAYS, end = now - END_DAYS
-        If start > end, swap for safety (warn).
-    """
-    now = datetime.now(timezone.utc)
-    start_iso = end_iso = None
-
-    if start_days is not None:
-        start = now - timedelta(days=int(start_days))
-        start_iso = start.isoformat(timespec="seconds").replace("+00:00", "Z")
-    if end_days is not None:
-        end = now - timedelta(days=int(end_days))
-        end_iso = end.isoformat(timespec="seconds").replace("+00:00", "Z")
-
-    if start_iso and end_iso:
-        # Ensure chronological order
-        if start_iso > end_iso:
-            # swap
-            start_iso, end_iso = end_iso, start_iso
-            print("[ripe] NOTE: START_DAYS produced a later time than END_DAYS; window swapped.", file=sys.stderr)
-
-    return RipeWindow(start_iso, end_iso)
-
-def fetch_asn_prefixes_from_ripestat(
-    asn: str,
-    min_peers: int,
-    start_days: Optional[int] = None,
-    end_days: Optional[int] = None,
-    session: Optional[requests.Session] = None,
-    retries: int = 3,
-    backoff_sec: float = 1.5,
-) -> Tuple[List[IPv4Net], List[IPv6Net]]:
-    """
-    Query RIPEstat Announced Prefixes for the given ASN and return IPv4/IPv6 lists.
-
-    - min_peers maps to RIPEstat 'min_peers_seeing' (default 10 per RIPEstat docs).  # cite
-    - Optional start/end derived from START_DAYS/END_DAYS.
-
-    Returns (v4_list, v6_list).
-    """
-    params = {
-        "resource": asn.lstrip().lstrip("AS").lstrip("as"),
-        "min_peers_seeing": int(min_peers),
-        "sourceapp": "asn-threat-feeds",  # polite identification (see RIPEstat usage docs)
-    }
-
-    window = _compute_time_window(start_days, end_days)
-    if window.start_iso:
-        params["starttime"] = window.start_iso
-    if window.end_iso:
-        params["endtime"] = window.end_iso
-
-    s = session or requests.Session()
-    attempt = 0
-    while True:
-        attempt += 1
+    for p in prefixes:
         try:
-            resp = s.get(RIPESTAT_BASE, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            # Expected structure: {'data': {'prefixes': [{'prefix': 'x/y', 'timelines': [...]}, ...], ...}}
-            d = data.get("data", {})
-            pref_entries = d.get("prefixes", [])
-            v4: List[IPv4Net] = []
-            v6: List[IPv6Net] = []
-            for entry in pref_entries:
-                pfx = entry.get("prefix")
-                if not pfx:
-                    continue
-                try:
-                    net = ipaddress.ip_network(pfx, strict=False)
-                except ValueError:
-                    continue
-                if isinstance(net, ipaddress.IPv4Network):
-                    v4.append(net)
-                else:
-                    v6.append(net)
-            return v4, v6
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            if attempt > retries:
-                raise
-            sleep_for = backoff_sec * attempt
-            print(f"[ripe] WARN: attempt {attempt}/{retries} failed for {asn}: {e}; retrying in {sleep_for:.1f}s", file=sys.stderr)
-            time.sleep(sleep_for)
+            net = ipaddress.ip_network(p, strict=False)
+        except ValueError:
+            logging.warning("Skipping invalid feed prefix %r", p)
+            continue
 
-# ----------------------
-# Builder
-# ----------------------
-def normalize(nets: Iterable[IPNet]) -> List[IPNet]:
-    """Your existing dedupe/minimize pipeline can replace this if desired."""
-    return collapse_and_sort(nets)
+        if isinstance(net, ipaddress.IPv4Network):
+            overlaps = [e for e in v4_ex if e.overlaps(net)]
+            residuals = subtract_many(net, overlaps) if overlaps else [net]
+            out_v4.extend(n for n in residuals if isinstance(n, ipaddress.IPv4Network))
+        else:
+            overlaps = [e for e in v6_ex if e.overlaps(net)]
+            residuals = subtract_many(net, overlaps) if overlaps else [net]
+            out_v6.extend(n for n in residuals if isinstance(n, ipaddress.IPv6Network))
 
-def build_feeds(
-    asns: List[str],
-    min_peers: int = 10,
-    start_days: Optional[int] = None,
-    end_days: Optional[int] = None,
-    out_dir: Path = Path("feeds"),
-) -> None:
+    # Normalize: collapse contiguous/overlapping networks
+    collapsed_v4 = ipaddress.collapse_addresses(out_v4)
+    collapsed_v6 = ipaddress.collapse_addresses(out_v6)
+
+    v4_list = [n.with_prefixlen for n in collapsed_v4]
+    v6_list = [n.with_prefixlen for n in collapsed_v6]
+    return v4_list + v6_list
+
+
+# ----------------------------- RIPEstat integration ---------------------------
+
+def fetch_announced_prefixes(asn: str, min_peers: int,
+                             start_iso: Optional[str],
+                             end_iso: Optional[str]) -> List[str]:
     """
-    Build all per-ASN and combined feeds, applying optional exclusions.
+    Query RIPEstat for announced prefixes of `asn`, respecting min_peers_seeing
+    and optional time window. Returns list of CIDR strings.
     """
+    # Normalize ASN (strip "AS" if present)
+    asn_clean = asn.upper().removeprefix("AS")
+    params = {
+        "resource": asn_clean,
+        "min_peers_seeing": int(min_peers),
+    }
+    if start_iso:
+        params["starttime"] = start_iso
+    if end_iso:
+        params["endtime"] = end_iso
 
-    # Load exclusions once
-    exclusions_path = out_dir / "exclusions.txt"
-    exclusions = load_exclusions(str(exclusions_path))
-    if exclusions:
-        print(f"[exclusions] Loaded {len(exclusions)} exclusion networks from {exclusions_path}")
-    else:
-        print("[exclusions] No exclusions found (proceeding without filtering)")
+    data = _http_get_json(RIPES_ANNOUNCED_PREFIXES, params)
+    # RIPEstat places prefixes under data->prefixes; each item has 'prefix'
+    prefixes = []
+    try:
+        items = data["data"]["prefixes"]
+        for it in items:
+            p = it.get("prefix")
+            if p:
+                prefixes.append(p.strip())
+    except Exception as e:  # noqa: BLE001
+        logging.error("Unexpected RIPEstat response for AS%s: %s", asn_clean, e)
+        raise
 
-    combined_v4: List[IPv4Net] = []
-    combined_v6: List[IPv6Net] = []
+    logging.info("AS%s: fetched %d announced prefixes (min_peers=%d)%s%s",
+                 asn_clean, len(prefixes), min_peers,
+                 f", start={start_iso}" if start_iso else "",
+                 f", end={end_iso}" if end_iso else "")
+    return prefixes
 
-    with requests.Session() as sess:
-        for asn in asns:
-            asn_norm = asn.strip()
-            if not asn_norm:
-                continue
-            # Ensure "AS12345" form in filenames
-            if not asn_norm.upper().startswith("AS"):
-                asn_norm = "AS" + asn_norm
 
-            print(f"[builder] Processing {asn_norm} ...")
+def separate_v4_v6(prefixes: Iterable[str]) -> Tuple[List[str], List[str]]:
+    v4, v6 = [], []
+    for p in prefixes:
+        try:
+            net = ipaddress.ip_network(p, strict=False)
+        except ValueError:
+            logging.warning("Skipping invalid prefix from API %r", p)
+            continue
+        if isinstance(net, ipaddress.IPv4Network):
+            v4.append(net.with_prefixlen)
+        else:
+            v6.append(net.with_prefixlen)
+    return v4, v6
 
-            v4_raw, v6_raw = fetch_asn_prefixes_from_ripestat(
-                asn=asn_norm,
-                min_peers=min_peers,
-                start_days=start_days,
-                end_days=end_days,
-                session=sess,
-            )
 
-            v4_final = normalize(v4_raw)
-            v6_final = normalize(v6_raw)
+def normalize_cidrs(cidrs: Iterable[str]) -> List[str]:
+    """Deduplicate/collapse a mixed v4/v6 list and return sorted strings."""
+    v4_nets = []
+    v6_nets = []
+    for c in cidrs:
+        try:
+            n = ipaddress.ip_network(c, strict=False)
+        except ValueError:
+            continue
+        if isinstance(n, ipaddress.IPv4Network):
+            v4_nets.append(n)
+        else:
+            v6_nets.append(n)
 
-            if exclusions:
-                v4_final = apply_exclusions(v4_final, exclusions)
-                v6_final = apply_exclusions(v6_final, exclusions)
+    v4_collapsed = ipaddress.collapse_addresses(sorted(v4_nets, key=lambda n: (int(n.network_address), n.prefixlen)))
+    v6_collapsed = ipaddress.collapse_addresses(sorted(v6_nets, key=lambda n: (int(n.network_address), n.prefixlen)))
 
-            # Write per-ASN files
-            write_cidrs(out_dir / f"{asn_norm.lower()}_ipv4.txt", v4_final)
-            write_cidrs(out_dir / f"{asn_norm.lower()}_ipv6.txt", v6_final)
+    out = [n.with_prefixlen for n in v4_collapsed] + [n.with_prefixlen for n in v6_collapsed]
+    # sort as strings for stable output: v4 before v6 for readability
+    out_v4 = [n.with_prefixlen for n in v4_collapsed]
+    out_v6 = [n.with_prefixlen for n in v6_collapsed]
+    return out_v4 + out_v6
 
-            # Per-ASN _all.txt (inside build_feeds loop)
-            asn_all = collapse_mixed(v4_final, v6_final)
-            write_cidrs(out_dir / f"{asn_norm.lower()}_all.txt", asn_all)
 
-            combined_v4.extend(v4_final)
-            combined_v6.extend(v6_final)
+# ------------------------------ File I/O helpers ------------------------------
 
-    # Combined outputs
-    combined_v4 = normalize(combined_v4)
-    combined_v6 = normalize(combined_v6)
+def write_lines(path: Path, lines: Sequence[str]) -> None:
+    """Write lines with trailing newline, only if content changed (idempotent)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_content = "".join(f"{l}\n" for l in lines)
 
-    if exclusions:
-        combined_v4 = apply_exclusions(combined_v4, exclusions)
-        combined_v6 = apply_exclusions(combined_v6, exclusions)
+    if path.exists():
+        try:
+            current = path.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            current = None
+        if current == new_content:
+            logging.info("No change: %s (%d entries)", path, len(lines))
+            return
 
-    write_cidrs(out_dir / "combined_ipv4.txt", combined_v4)
-    write_cidrs(out_dir / "combined_ipv6.txt", combined_v6)
+    path.write_text(new_content, encoding="utf-8")
+    logging.info("Wrote %s (%d entries)", path, len(lines))
 
-    # Global combined_all.txt (after combined_v4/combined_v6 are finalized)
-    combined_all = collapse_mixed(combined_v4, combined_v6)
-    write_cidrs(out_dir / "combined_all.txt", combined_all)
 
-    print("[builder] Done.")
+# --------------------------------- Main flow ----------------------------------
 
-# ----------------------
-# Entrypoint
-# ----------------------
-def _parse_env_list(var: str, default: str = "") -> List[str]:
-    raw = os.environ.get(var, default)
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-def main():
+def build_for_asn(asn: str,
+                  min_peers: int,
+                  start_iso: Optional[str],
+                  end_iso: Optional[str],
+                  exclusions: Set[ipaddress._BaseNetwork]) -> Tuple[List[str], List[str], List[str]]:
     """
-    Env vars:
-      - ASNS           (required) e.g., "AS19318,AS13335"
-      - MIN_PEERS      (optional, default 10)
-      - START_DAYS     (optional, integer)
-      - END_DAYS       (optional, integer)
+    Build feed lists for a single ASN.
+    Returns (ipv4_list, ipv6_list, all_list).
     """
-    asns = _parse_env_list("ASNS")
+    raw = fetch_announced_prefixes(asn, min_peers, start_iso, end_iso)
+
+    # Apply exclusions (true subtraction) then normalize/dedupe
+    filtered = apply_exclusions(raw, exclusions) if exclusions else raw
+    final = normalize_cidrs(filtered)
+
+    v4, v6 = separate_v4_v6(final)
+    all_list = v4 + v6
+    asn_lower = asn.lower().removeprefix("as")
+    # Write per-ASN files
+    write_lines(FEEDS_DIR / f"as{asn_lower}_ipv4.txt", v4)
+    write_lines(FEEDS_DIR / f"as{asn_lower}_ipv6.txt", v6)
+    write_lines(FEEDS_DIR / f"as{asn_lower}_all.txt", all_list)
+    return v4, v6, all_list
+
+
+def main() -> None:
+    # Read environment
+    asns_env = os.environ.get("ASNS", "").strip()
+    if not asns_env:
+        raise SystemExit("ASNS environment variable is required (e.g., 'AS19318,AS13335').")
+
+    # Allow "AS123" or "123"
+    asns = [a.strip().upper() for a in asns_env.split(",") if a.strip()]
     if not asns:
-        raise SystemExit("ASNS is required (comma-separated list of target ASNs)")
+        raise SystemExit("No valid ASNs provided in ASNS.")
+
     try:
         min_peers = int(os.environ.get("MIN_PEERS", "10"))
-    except ValueError:
-        min_peers = 10
+    except ValueError as e:
+        raise SystemExit(f"MIN_PEERS must be an integer: {e}") from e
 
-    start_days_env = os.environ.get("START_DAYS")
-    end_days_env = os.environ.get("END_DAYS")
+    # Optional days offsets
+    start_days = os.environ.get("START_DAYS")
+    end_days = os.environ.get("END_DAYS")
 
-    start_days = int(start_days_env) if start_days_env not in (None, "") else None
-    end_days = int(end_days_env) if end_days_env not in (None, "") else None
+    try:
+        start_iso = _iso8601_from_days(int(start_days)) if start_days else None
+        end_iso = _iso8601_from_days(int(end_days)) if end_days else None
+    except ValueError as e:
+        raise SystemExit(f"Invalid START_DAYS/END_DAYS: {e}") from e
 
-    build_feeds(
-        asns=asns,
-        min_peers=min_peers,
-        start_days=start_days,
-        end_days=end_days,
-        out_dir=Path("feeds"),
-    )
+    # Load exclusions (supports inline comments)
+    exclusions = load_exclusions(EXCLUSIONS_FILE)
+
+    # Per-ASN builds
+    combined_v4: List[str] = []
+    combined_v6: List[str] = []
+    combined_all: List[str] = []
+
+    for asn in asns:
+        v4, v6, all_list = build_for_asn(asn, min_peers, start_iso, end_iso, exclusions)
+        combined_v4.extend(v4)
+        combined_v6.extend(v6)
+        combined_all.extend(all_list)
+
+    # Normalize combined lists
+    combined_v4 = normalize_cidrs(combined_v4)
+    combined_v6 = normalize_cidrs(combined_v6)
+    combined_all = normalize_cidrs(combined_all)
+
+    # Write combined files
+    write_lines(FEEDS_DIR / "combined_ipv4.txt", combined_v4)
+    write_lines(FEEDS_DIR / "combined_ipv6.txt", combined_v6)
+    write_lines(FEEDS_DIR / "combined_all.txt", combined_all)
+
+    logging.info("Done. %d ASNs processed.", len(asns))
+
 
 if __name__ == "__main__":
     main()
