@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_multi_asn_feeds.py  — with Diagnostics Mode
+build_multi_asn_feeds.py  — with Diagnostics Mode, per-run diag folder, and summary.json
 
 Generates FortiGate-compatible CIDR feeds from live BGP announcements
 for one or more ASNs using RIPEstat's "announced-prefixes" API.
 
 DIAGNOSTICS MODE (env DIAG=1)
 -----------------------------
-When enabled, prints richer runtime details and can write diagnostic
-artifacts to feeds/diag/:
-  - Effective environment (ASNS/MIN_PEERS/time window/diag flags)
-  - Raw vs. post-exclusion counts per ASN
-  - Optional prefix samples before/after exclusions
-  - Build log and final feed sizes
+When enabled, prints richer runtime details and writes diagnostic artifacts
+to feeds/diag/<run_id>/:
+  - build.log (always written on completion or error)
+  - summary.json (environment + per-ASN counts + combined sizes)
+  - as<asn>_raw.txt and as<asn>_after_exclusions.txt (samples)
 
 Environment variables
 ---------------------
@@ -25,8 +24,8 @@ END_DAYS    Optional int: end time   = now() - END_DAYS   days
 
 # Diagnostics (all optional)
 DIAG                    "0" (default) or "1" to enable diagnostics
-DIAG_MAX_PREFIXES       Max sample lines to print/write (default: 50)
-DIAG_WRITE_FILES        "0"/"1" write detailed samples under feeds/diag/ (default: 1)
+DIAG_MAX_PREFIXES       Max sample lines to write into diag files (default: 50)
+DIAG_WRITE_FILES        "0"/"1" write detailed samples under feeds/diag/<run_id>/ (default: 1)
 DIAG_SHOW_EXCLUSIONS    "0"/"1" echo first N lines of exclusions (default: 1)
 
 Outputs
@@ -38,8 +37,9 @@ feeds/
   combined_ipv4.txt
   combined_ipv6.txt
   combined_all.txt
-  diag/                (only if DIAG=1)
+  diag/<run_id>/
     build.log
+    summary.json
     as<asn>_raw.txt
     as<asn>_after_exclusions.txt
 """
@@ -51,6 +51,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
@@ -77,6 +78,10 @@ HTTP_TIMEOUT = 30  # seconds
 HTTP_RETRY = 3
 HTTP_RETRY_SLEEP = 2  # seconds base (exponential backoff)
 
+# Per-run diagnostics subfolder (use GitHub Actions run id if present)
+GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID")  # provided by GitHub Actions
+RUN_SUBDIR = DIAG_DIR / (GITHUB_RUN_ID or "local")
+
 
 # ------------------------------- Diagnostics ---------------------------------
 
@@ -87,12 +92,13 @@ def _as_bool(val: Optional[str], default: bool = False) -> bool:
 
 
 class Diag:
-    """Simple diagnostics helper that can buffer + write to feeds/diag/build.log."""
+    """Diagnostics helper that buffers logs and writes to feeds/diag/<run_id>/."""
     enabled: bool
     max_prefixes: int
     write_files: bool
     show_exclusions: bool
     log_buffer: io.StringIO
+    summary: dict
 
     def __init__(self) -> None:
         self.enabled = _as_bool(os.environ.get("DIAG"), False)
@@ -100,6 +106,16 @@ class Diag:
         self.write_files = _as_bool(os.environ.get("DIAG_WRITE_FILES"), True)
         self.show_exclusions = _as_bool(os.environ.get("DIAG_SHOW_EXCLUSIONS"), True)
         self.log_buffer = io.StringIO()
+        self.summary = {
+            "run": {
+                "run_id": GITHUB_RUN_ID or "local",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "env": {},  # filled in from main()
+            },
+            "asns": [],     # list of per-ASN dicts
+            "combined": {}, # filled after build
+            "notes": "Counts reflect what was seen and written during this run.",
+        }
 
     def print(self, *args) -> None:
         msg = " ".join(str(a) for a in args)
@@ -110,15 +126,58 @@ class Diag:
     def dump_to_file(self) -> None:
         if not self.enabled:
             return
-        DIAG_DIR.mkdir(parents=True, exist_ok=True)
-        (DIAG_DIR / "build.log").write_text(self.log_buffer.getvalue(), encoding="utf-8")
+        RUN_SUBDIR.mkdir(parents=True, exist_ok=True)
+        (RUN_SUBDIR / "build.log").write_text(self.log_buffer.getvalue(), encoding="utf-8")
+
+    def dump_summary(self) -> None:
+        if not self.enabled:
+            return
+        RUN_SUBDIR.mkdir(parents=True, exist_ok=True)
+        (RUN_SUBDIR / "summary.json").write_text(
+            json.dumps(self.summary, indent=2, sort_keys=False), encoding="utf-8"
+        )
 
     def write_sample(self, name: str, lines: Sequence[str]) -> None:
         if not (self.enabled and self.write_files):
             return
-        DIAG_DIR.mkdir(parents=True, exist_ok=True)
+        RUN_SUBDIR.mkdir(parents=True, exist_ok=True)
         sample = lines[: self.max_prefixes]
-        (DIAG_DIR / name).write_text("\n".join(sample) + ("\n" if sample else ""), encoding="utf-8")
+        (RUN_SUBDIR / name).write_text("\n".join(sample) + ("\n" if sample else ""), encoding="utf-8")
+
+    def record_env(self, asns_env: str, min_peers: int, start_iso: Optional[str], end_iso: Optional[str]) -> None:
+        if not self.enabled:
+            return
+        self.summary["run"]["env"] = {
+            "ASNS": asns_env,
+            "MIN_PEERS": min_peers,
+            "START_ISO": start_iso,
+            "END_ISO": end_iso,
+            "DIAG": os.environ.get("DIAG"),
+            "DIAG_MAX_PREFIXES": self.max_prefixes,
+            "DIAG_WRITE_FILES": self.write_files,
+            "DIAG_SHOW_EXCLUSIONS": self.show_exclusions,
+        }
+
+    def record_asn(self, asn: str, raw: int, after_excl: int, final_v4: int, final_v6: int, error: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        self.summary["asns"].append({
+            "asn": asn.upper() if asn.upper().startswith("AS") else f"AS{asn}",
+            "raw_prefixes": raw,
+            "after_exclusions": after_excl,
+            "final_ipv4": final_v4,
+            "final_ipv6": final_v6,
+            **({"error": error} if error else {}),
+        })
+
+    def record_combined(self, final_v4: int, final_v6: int) -> None:
+        if not self.enabled:
+            return
+        self.summary["combined"] = {
+            "final_ipv4": final_v4,
+            "final_ipv6": final_v6,
+            "final_all": final_v4 + final_v6,
+        }
 
 
 diag = Diag()
@@ -151,7 +210,7 @@ def _http_get_json(url: str, params: dict) -> dict:
     last_err: Optional[Exception] = None
     for attempt in range(1, HTTP_RETRY + 1):
         try:
-            req = urllib.request.Request(full_url, headers={"User-Agent": "asn-threat-feeds/1.1"})
+            req = urllib.request.Request(full_url, headers={"User-Agent": "asn-threat-feeds/1.3"})
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
@@ -392,29 +451,41 @@ def build_for_asn(asn: str,
     Build feed lists for a single ASN.
     Returns (ipv4_list, ipv6_list, all_list).
     """
-    raw = fetch_announced_prefixes(asn, min_peers, start_iso, end_iso)
-    diag.print(f"AS{asn.upper().removeprefix('AS')}: raw count before exclusions: {len(raw)}")
-    if diag.enabled:
-        diag.write_sample(f"as{asn.lower().removeprefix('as')}_raw.txt", [p for p in raw][: diag.max_prefixes])
+    error_text: Optional[str] = None
+    raw: List[str] = []
+    filtered: List[str] = []
+    try:
+        raw = fetch_announced_prefixes(asn, min_peers, start_iso, end_iso)
+        diag.print(f"AS{asn.upper().removeprefix('AS')}: raw count before exclusions: {len(raw)}")
+        if diag.enabled:
+            diag.write_sample(f"as{asn.lower().removeprefix('as')}_raw.txt", [p for p in raw])
 
-    filtered = apply_exclusions(raw, exclusions) if exclusions else raw
-    diag.print(f"AS{asn.upper().removeprefix('AS')}: count after exclusions: {len(filtered)}")
-    if diag.enabled:
-        diag.write_sample(
-            f"as{asn.lower().removeprefix('as')}_after_exclusions.txt",
-            [p for p in filtered][: diag.max_prefixes],
-        )
+        filtered = apply_exclusions(raw, exclusions) if exclusions else raw
+        diag.print(f"AS{asn.upper().removeprefix('AS')}: count after exclusions: {len(filtered)}")
+        if diag.enabled:
+            diag.write_sample(
+                f"as{asn.lower().removeprefix('as')}_after_exclusions.txt",
+                [p for p in filtered],
+            )
 
-    final = normalize_cidrs(filtered)
+        final = normalize_cidrs(filtered)
 
-    v4, v6 = separate_v4_v6(final)
-    all_list = v4 + v6
-    asn_lower = asn.lower().removeprefix("as")
-    # Write per-ASN files
-    write_lines(FEEDS_DIR / f"as{asn_lower}_ipv4.txt", v4)
-    write_lines(FEEDS_DIR / f"as{asn_lower}_ipv6.txt", v6)
-    write_lines(FEEDS_DIR / f"as{asn_lower}_all.txt", all_list)
-    return v4, v6, all_list
+        v4, v6 = separate_v4_v6(final)
+        all_list = v4 + v6
+        asn_lower = asn.lower().removeprefix("as")
+        # Write per-ASN files
+        write_lines(FEEDS_DIR / f"as{asn_lower}_ipv4.txt", v4)
+        write_lines(FEEDS_DIR / f"as{asn_lower}_ipv6.txt", v6)
+        write_lines(FEEDS_DIR / f"as{asn_lower}_all.txt", all_list)
+
+        # Record counts to summary
+        diag.record_asn(asn, raw=len(raw), after_excl=len(filtered), final_v4=len(v4), final_v6=len(v6))
+        return v4, v6, all_list
+
+    except Exception as e:  # noqa: BLE001
+        error_text = repr(e)
+        diag.record_asn(asn, raw=len(raw), after_excl=len(filtered), final_v4=0, final_v6=0, error=error_text)
+        raise
 
 
 def main() -> None:
@@ -443,13 +514,15 @@ def main() -> None:
     except ValueError as e:
         raise SystemExit(f"Invalid START_DAYS/END_DAYS: {e}") from e
 
-    # Diagnostics header
+    # Diagnostics header + env snapshot
     if diag.enabled:
         diag.print("=== DIAGNOSTICS MODE ENABLED ===")
         diag.print(f"ASNS={asns_env}")
         diag.print(f"MIN_PEERS={min_peers}")
         diag.print(f"START_ISO={start_iso}  END_ISO={end_iso}")
         diag.print(f"DIAG_MAX_PREFIXES={diag.max_prefixes} DIAG_WRITE_FILES={diag.write_files} DIAG_SHOW_EXCLUSIONS={diag.show_exclusions}")
+        diag.print(f"GITHUB_RUN_ID={GITHUB_RUN_ID or 'local'}  RUN_SUBDIR={RUN_SUBDIR}")
+        diag.record_env(asns_env, min_peers, start_iso, end_iso)
 
     exclusions = load_exclusions(EXCLUSIONS_FILE)
 
@@ -475,14 +548,30 @@ def main() -> None:
     write_lines(FEEDS_DIR / "combined_all.txt", combined_all)
 
     if diag.enabled:
-        # Show final sizes
+        # Show final sizes and write to summary
         for name in ("combined_ipv4.txt", "combined_ipv6.txt", "combined_all.txt"):
             p = FEEDS_DIR / name
             diag.print(f"{name}: {'missing' if not p.exists() else p.stat().st_size} bytes")
-        diag.dump_to_file()
-
-    logging.info("Done. %d ASNs processed.", len(asns))
+        diag.record_combined(final_v4=len(combined_v4), final_v6=len(combined_v6))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        diag.print(f"ERROR: SystemExit {e}")
+        # Flush both log and summary on exit
+        diag.dump_summary()
+        diag.dump_to_file()
+        raise
+    except Exception as e:  # noqa: BLE001
+        diag.print("UNCAUGHT EXCEPTION:", repr(e))
+        diag.print(traceback.format_exc())
+        # Flush both log and summary on error
+        diag.dump_summary()
+        diag.dump_to_file()
+        raise
+    else:
+        # Normal completion: write summary + build.log
+        diag.dump_summary()
+        diag.dump_to_file()
