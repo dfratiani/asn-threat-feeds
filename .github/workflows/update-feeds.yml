@@ -1,86 +1,63 @@
-name: Update ASN Threat Feeds
+name: Update ASN Feeds
 
 on:
   workflow_dispatch:
-    inputs:
-      diag:
-        description: "Enable diagnostics mode (1 to enable)"
-        required: false
-        default: "0"
   schedule:
-    - cron: "0 5 * * *"
+    - cron: "20 */8 * * *"  # every 8 hours, offset a bit to avoid API rush hours
 
 permissions:
   contents: write
 
+concurrency:
+  group: asn-feeds
+  cancel-in-progress: false
+
 jobs:
-  build:
+  build-and-publish:
     runs-on: ubuntu-latest
+
     env:
-      # --- Configure your targets here ---
-      ASNS: AS19318                     # Example; comma-separated values are supported
-      MIN_PEERS: "10"                   # RIPEstat min_peers_seeing
-
-      # Optional time window (unset for RIPEstat default rolling window)
-      # START_DAYS: "7"
+      # === Configure your targets here ===
+      ASNS: AS19318
+      MIN_PEERS: "10"
+      # Optional rolling window. Examples:
+      # START_DAYS: "14"
       # END_DAYS: "0"
-
-      # --- Diagnostics (set DIAG=1 to enable) ---
-      DIAG: ${{ github.event.inputs.diag || '0' }}
-      DIAG_MAX_PREFIXES: "50"
-      DIAG_WRITE_FILES: "1"
-      DIAG_SHOW_EXCLUSIONS: "1"
-
-      # Provide run id to the script so it writes to feeds/diag/<run_id>/
-      GITHUB_RUN_ID: ${{ github.run_id }}
+      OUTPUT_DIR: feeds
+      EXCLUSIONS_FILE: feeds/exclusions.txt
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
-      - name: Echo effective environment (quick view)
+      - name: Install deps
         run: |
-          echo "ASNS=$ASNS"
-          echo "MIN_PEERS=$MIN_PEERS"
-          echo "START_DAYS=$START_DAYS END_DAYS=$END_DAYS"
-          echo "DIAG=$DIAG DIAG_MAX_PREFIXES=$DIAG_MAX_PREFIXES DIAG_WRITE_FILES=$DIAG_WRITE_FILES DIAG_SHOW_EXCLUSIONS=$DIAG_SHOW_EXCLUSIONS"
-          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Run builder
+      - name: Build feeds
+        env:
+          ASNS: ${{ env.ASNS }}
+          MIN_PEERS: ${{ env.MIN_PEERS }}
+          START_DAYS: ${{ env.START_DAYS }}
+          END_DAYS: ${{ env.END_DAYS }}
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
+          EXCLUSIONS_FILE: ${{ env.EXCLUSIONS_FILE }}
         run: |
           python scripts/build_multi_asn_feeds.py
 
-      - name: Show diagnostic summary (if any)
-        if: env.DIAG == '1'
+      - name: Commit & push if changed
         run: |
-          echo "Diagnostics enabled, dumping brief summary:"
-          ls -la feeds || true
-          ls -la feeds/diag || true
-          echo "---- build.log (tail) ----"
-          tail -n 200 "feeds/diag/$GITHUB_RUN_ID/build.log" || true
-          echo "---- summary.json ----"
-          cat "feeds/diag/$GITHUB_RUN_ID/summary.json" || true
-
-      - name: Upload diagnostics artifact
-        if: env.DIAG == '1'
-        uses: actions/upload-artifact@v4
-        with:
-          name: diag-${{ github.run_id }}
-          path: feeds/diag/
-
-      - name: Commit and push if feeds changed
-        run: |
-          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "Update feeds (CI) [skip ci]"
+          if [[ -n "$(git status --porcelain ${OUTPUT_DIR})" ]]; then
+            git add ${OUTPUT_DIR}
+            git commit -m "chore(feeds): update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push
           else
             echo "No changes to commit."
