@@ -1,1 +1,2 @@
-66.45.250.106/32
+66.45.250.106/32 # edmentum.clickhelp.co
+64.20.44.154/32 # portaportal.com
