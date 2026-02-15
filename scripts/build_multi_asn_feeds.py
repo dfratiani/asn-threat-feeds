@@ -5,15 +5,16 @@
 Builds FortiGate-compatible CIDR feeds per ASN and combined, using RIPEstat.
 - Per-ASN: feeds/as<asn>_ipv4.txt, as<asn>_ipv6.txt, as<asn>_all.txt
 - Combined: feeds/combined_ipv4.txt, combined_ipv6.txt, combined_all.txt
-- Optional permanent exclusions: feeds/exclusions.txt (one CIDR per line, '#' comments allowed)
+- Optional permanent exclusions: feeds/exclusions.txt (one CIDR per line, supports inline '#' or ';' comments)
 
 Environment variables:
-  ASNS           Comma-separated list, e.g., "AS19318,AS15169"
-  MIN_PEERS      Integer; RIPEstat min_peers_seeing filter (default 10)
-  START_DAYS     Optional int; start of time window in days ago (e.g., 14)
-  END_DAYS       Optional int; end of time window in days ago (e.g., 0)
-  OUTPUT_DIR     Defaults to "feeds"
+  ASNS            Comma-separated list, e.g., "AS19318,AS15169"  (required)
+  MIN_PEERS       Integer; RIPEstat min_peers_seeing filter (default 10)
+  START_DAYS      Optional int; start of time window in days ago (e.g., 14)
+  END_DAYS        Optional int; end of time window in days ago (e.g., 0)
+  OUTPUT_DIR      Defaults to "feeds"
   EXCLUSIONS_FILE Defaults to "feeds/exclusions.txt"
+  LOG_LEVEL       INFO (default), DEBUG, WARNING, ...
 
 Data source:
   RIPEstat 'announced-prefixes' endpoint:
@@ -58,28 +59,48 @@ def parse_asns(asns_str: str) -> List[str]:
         out.append(token)
     return out
 
+def _strip_inline_comment(s: str) -> str:
+    """Return s with any trailing '#' or ';' comment removed."""
+    if not s:
+        return s
+    cut = len(s)
+    for marker in ("#", ";"):
+        idx = s.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    return s[:cut].strip()
+
 def read_exclusions(path: str) -> List[ipaddress._BaseNetwork]:
     nets = []
     if not path or not os.path.exists(path):
         return nets
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            s = line.strip()
-            if not s or s.startswith("#") or s.startswith(";"):
+            raw = line.strip()
+            if not raw or raw.startswith("#") or raw.startswith(";"):
+                continue
+            s = _strip_inline_comment(raw)
+            if not s:
                 continue
             try:
                 nets.append(ipaddress.ip_network(s, strict=False))
             except Exception:
-                logging.warning("Skipping invalid exclusion entry: %s", s)
+                logging.warning("Skipping invalid exclusion entry: %s", raw)
     return nets
 
 def collapse_and_sort(networks: Iterable[ipaddress._BaseNetwork]) -> List[ipaddress._BaseNetwork]:
-    # Normalize, collapse, and return sorted (family, network_address, prefixlen)
-    collapsed = ipaddress.collapse_addresses(networks)
+    """
+    Collapse and sort networks; supports mixed IPv4/IPv6 by collapsing per-family first.
+    """
+    v4 = [n for n in networks if isinstance(n, ipaddress.IPv4Network)]
+    v6 = [n for n in networks if isinstance(n, ipaddress.IPv6Network)]
+    v4 = list(ipaddress.collapse_addresses(v4)) if v4 else []
+    v6 = list(ipaddress.collapse_addresses(v6)) if v6 else []
+
     def key(n):
-        # IPv4 first, then IPv6; then by integer address, then prefix length
         return (0 if isinstance(n, ipaddress.IPv4Network) else 1, int(n.network_address), n.prefixlen)
-    return sorted(collapsed, key=key)
+
+    return sorted(v4 + v6, key=key)
 
 def subtract_exclusions(includes: Iterable[ipaddress._BaseNetwork],
                         exclusions: Iterable[ipaddress._BaseNetwork]) -> List[ipaddress._BaseNetwork]:
@@ -93,25 +114,23 @@ def subtract_exclusions(includes: Iterable[ipaddress._BaseNetwork],
     }
 
     def split_subtract(base: ipaddress._BaseNetwork, excl_list: List[ipaddress._BaseNetwork]) -> List[ipaddress._BaseNetwork]:
-        # If any exclusion fully covers base, drop it.
         for e in excl_list:
+            # If excluded fully covers 'base', drop it.
             if e.supernet_of(base) or e == base:
                 return []
-        # Find any overlapping exclusions and split base until no overlap.
-        # If no overlap at all, keep base as-is.
+        # Partial overlap? split and recurse
         for e in excl_list:
             if base.overlaps(e) and not (e.supernet_of(base) or e == base):
-                # Partial overlap: split base into two equal subnets and recurse
                 try:
                     parts = list(base.subnets(prefixlen_diff=1))
                 except ValueError:
-                    # Can't split further; drop if overlapping to be safe
+                    # Can't split further; drop to be safe
                     return []
                 out = []
                 for p in parts:
                     out.extend(split_subtract(p, excl_list))
                 return out
-        # No overlap with any exclusion:
+        # No overlap: keep base
         return [base]
 
     result = []
@@ -138,19 +157,16 @@ def write_if_changed(path: str, lines: List[str]) -> bool:
     logging.info("Wrote %s (%d lines)", path, len(lines))
     return True
 
-def now_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+def to_utc_iso(d: dt.datetime) -> str:
+    return d.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def compute_window(start_days: str, end_days: str) -> Tuple[str, str]:
     """
     Returns (start_iso, end_iso) or (None, None) if no window.
     START_DAYS and END_DAYS are interpreted as offsets from 'now' in days.
-    If only START_DAYS is set: start=now-START_DAYS, end=now
-    If only END_DAYS is set: start=epoch (or 1970-01-01), end=now-END_DAYS
-    If both: start=now-START_DAYS, end=now-END_DAYS, and start <= end enforced
     """
     start_iso = end_iso = None
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.UTC)
     if start_days and end_days:
         try:
             sd = int(start_days)
@@ -158,27 +174,26 @@ def compute_window(start_days: str, end_days: str) -> Tuple[str, str]:
             start = now - dt.timedelta(days=sd)
             end = now - dt.timedelta(days=ed)
             if start > end:
-                # swap
                 start, end = end, start
-            start_iso = start.replace(microsecond=0).isoformat()
-            end_iso = end.replace(microsecond=0).isoformat()
+            start_iso = to_utc_iso(start)
+            end_iso = to_utc_iso(end)
         except Exception:
             logging.warning("Invalid START_DAYS/END_DAYS; ignoring window.")
     elif start_days and not end_days:
         try:
             sd = int(start_days)
             start = now - dt.timedelta(days=sd)
-            start_iso = start.replace(microsecond=0).isoformat()
-            end_iso = now.replace(microsecond=0).isoformat()
+            start_iso = to_utc_iso(start)
+            end_iso = to_utc_iso(now)
         except Exception:
             logging.warning("Invalid START_DAYS; ignoring.")
     elif end_days and not start_days:
         try:
             ed = int(end_days)
-            start = dt.datetime.utcfromtimestamp(0)
+            start = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
             end = now - dt.timedelta(days=ed)
-            start_iso = start.replace(microsecond=0).isoformat()
-            end_iso = end.replace(microsecond=0).isoformat()
+            start_iso = to_utc_iso(start)
+            end_iso = to_utc_iso(end)
         except Exception:
             logging.warning("Invalid END_DAYS; ignoring.")
     return start_iso, end_iso
@@ -262,10 +277,8 @@ def main() -> int:
             except Exception:
                 logging.warning("Skipping invalid prefix from API: %s", p)
 
-        # Collapse
+        # Collapse (mixed families supported) then subtract exclusions and collapse again
         nets = collapse_and_sort(nets)
-
-        # Subtract exclusions
         if exclusions:
             nets = subtract_exclusions(nets, exclusions)
 
@@ -279,7 +292,7 @@ def main() -> int:
         # Prepare strings
         v4_lines = [str(n) for n in v4]
         v6_lines = [str(n) for n in v6]
-        all_lines = [str(n) for n in collapse_and_sort(nets)]  # ensure collapsed after subtraction
+        all_lines = [str(n) for n in nets]  # already collapsed
 
         # Write per-ASN files
         any_changes |= write_if_changed(os.path.join(output_dir, f"as{asn}_ipv4.txt"), v4_lines)
